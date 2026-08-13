@@ -429,7 +429,21 @@ def calculate_changes(
     return changes, summary
 
 
-def build_offers_xml(changes: list[Change], catalog_id: str, catalog_name: str) -> bytes:
+def parse_editions(value: str) -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
+    for part in value.split(";"):
+        name, separator, option = part.partition(":")
+        if separator and name.strip() and option.strip():
+            result.append((name.strip(), option.strip()))
+    return result
+
+
+def build_offers_xml(
+    changes: list[Change],
+    items: list[TildaItem],
+    catalog_id: str,
+    catalog_name: str,
+) -> bytes:
     root = ET.Element(
         "КоммерческаяИнформация",
         {
@@ -442,18 +456,41 @@ def build_offers_xml(changes: list[Change], catalog_id: str, catalog_name: str) 
     ET.SubElement(package, "Наименование").text = catalog_name
     ET.SubElement(package, "ИдКаталога").text = catalog_id
     ET.SubElement(package, "ИдКлассификатора").text = catalog_id
+    by_uid = {item.tilda_uid: item for item in items}
+    item_by_external_id = {item.external_id: item for item in items if item.external_id}
     offers = ET.SubElement(package, "Предложения")
     for change in changes:
+        item = item_by_external_id.get(change.external_id)
+        if item is None:
+            raise SyncError(f"Changed item not found in Tilda snapshot: {change.external_id}")
+        parent = by_uid.get(item.parent_uid) if item.parent_uid else None
+        if item.parent_uid and parent is None:
+            raise SyncError(f"Parent item not found in Tilda snapshot: {item.parent_uid}")
+        if parent and not parent.external_id:
+            raise SyncError(f"Parent item without External ID: {parent.tilda_uid}")
         offer = ET.SubElement(offers, "Предложение")
-        ET.SubElement(offer, "Ид").text = change.external_id
+        offer_id = f"{parent.external_id}#{change.external_id}" if parent else change.external_id
+        ET.SubElement(offer, "Ид").text = offer_id
         ET.SubElement(offer, "Наименование").text = change.title
+        characteristics = parse_editions(item.editions)
+        if characteristics:
+            characteristics_node = ET.SubElement(offer, "ХарактеристикиТовара")
+            for name, value in characteristics:
+                characteristic = ET.SubElement(characteristics_node, "ХарактеристикаТовара")
+                ET.SubElement(characteristic, "Наименование").text = name
+                ET.SubElement(characteristic, "Значение").text = value
         ET.SubElement(offer, "Количество").text = format_quantity(change.new_quantity)
     ET.indent(root, space="  ")
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
-def build_import_stub_xml(catalog_id: str, catalog_name: str) -> bytes:
-    """Build the non-destructive catalog file required before stock offers."""
+def build_import_xml(
+    items: list[TildaItem],
+    changes: list[Change],
+    catalog_id: str,
+    catalog_name: str,
+) -> bytes:
+    """Build a changes-only catalog containing products referenced by offers."""
     root = ET.Element(
         "КоммерческаяИнформация",
         {
@@ -469,7 +506,25 @@ def build_import_stub_xml(catalog_id: str, catalog_name: str) -> bytes:
     ET.SubElement(catalog, "Ид").text = catalog_id
     ET.SubElement(catalog, "ИдКлассификатора").text = catalog_id
     ET.SubElement(catalog, "Наименование").text = catalog_name
-    ET.SubElement(catalog, "Товары")
+    products = ET.SubElement(catalog, "Товары")
+    by_uid = {item.tilda_uid: item for item in items}
+    item_by_external_id = {item.external_id: item for item in items if item.external_id}
+    product_items: dict[str, TildaItem] = {}
+    for change in changes:
+        item = item_by_external_id.get(change.external_id)
+        if item is None:
+            raise SyncError(f"Changed item not found in Tilda snapshot: {change.external_id}")
+        parent = by_uid.get(item.parent_uid) if item.parent_uid else None
+        if item.parent_uid and parent is None:
+            raise SyncError(f"Parent item not found in Tilda snapshot: {item.parent_uid}")
+        product = parent or item
+        if not product.external_id:
+            raise SyncError(f"Product without External ID for changed item: {change.external_id}")
+        product_items[product.external_id] = product
+    for product in product_items.values():
+        product_node = ET.SubElement(products, "Товар")
+        ET.SubElement(product_node, "Ид").text = product.external_id
+        ET.SubElement(product_node, "Наименование").text = product.title
     ET.indent(root, space="  ")
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
@@ -586,9 +641,8 @@ class CommerceMLClient:
 
     def upload_offers(
         self,
+        import_bytes: bytes,
         xml_bytes: bytes,
-        catalog_id: str,
-        catalog_name: str,
         import_filename: str = "import0_1.xml",
         offers_filename: str = "offers0_1.xml",
     ) -> list[tuple[str, str]]:
@@ -605,7 +659,6 @@ class CommerceMLClient:
             raise SyncError(f"CommerceML init failed: {init[:500]}")
         if re.search(r"(?im)^zip\s*=\s*yes\s*$", init):
             raise SyncError("Tilda requested ZIP CommerceML upload; version 0.1 supports only zip=no")
-        import_bytes = build_import_stub_xml(catalog_id, catalog_name)
         for operation, filename, payload in (
             ("file-import", import_filename, import_bytes),
             ("file-offers", offers_filename, xml_bytes),
@@ -617,6 +670,41 @@ class CommerceMLClient:
         self._poll_import(import_filename, transcript)
         self._poll_import(offers_filename, transcript)
         return transcript
+
+
+def safe_transcript_response(operation: str, response: str) -> str:
+    """Keep protocol diagnostics without persisting credentials or session cookies."""
+    if operation == "checkauth":
+        return response.splitlines()[0].strip() if response else ""
+    return response[:500]
+
+
+def sanitize_summary_files(output_dir: Path) -> int:
+    """Redact checkauth session data from summaries created by older versions."""
+    sanitized = 0
+    for path in output_dir.glob("summary-*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        changed = False
+        for row in payload.get("commerce_transcript", []):
+            if row.get("operation") == "checkauth" and isinstance(row.get("response"), str):
+                safe = safe_transcript_response("checkauth", row["response"])
+                if safe != row["response"]:
+                    row["response"] = safe
+                    changed = True
+        if payload.get("mode") == "apply" and "verified" not in payload:
+            payload["submitted"] = bool(payload.get("applied"))
+            payload["verified"] = False
+            payload["applied"] = False
+            changed = True
+        if changed:
+            temp = path.with_suffix(path.suffix + ".tmp")
+            temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            temp.replace(path)
+            sanitized += 1
+    return sanitized
 
 
 def acquire_lock(path: Path) -> int:
@@ -652,7 +740,14 @@ def run_once(base_dir: Path, config: dict[str, Any], args: argparse.Namespace) -
     logging.info("MoySklad store resolved: %s", store.get("name"))
     source = ms.stock_by_store(store)
     logging.info("MoySklad stock entities loaded: %s", len(source))
-    state = read_state(state_path, items)
+    if bool(config.get("trust_local_state", False)):
+        state = read_state(state_path, items)
+    else:
+        state = {
+            item.external_id: item.current_quantity
+            for item in items
+            if item.external_id and item.current_quantity is not None
+        }
     changes, summary = calculate_changes(
         items,
         source,
@@ -665,11 +760,27 @@ def run_once(base_dir: Path, config: dict[str, Any], args: argparse.Namespace) -
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = base_dir / config["output_dir"]
     output_dir.mkdir(parents=True, exist_ok=True)
+    sanitized_summaries = sanitize_summary_files(output_dir)
+    if sanitized_summaries:
+        logging.warning("Redacted session data from %s existing summary file(s)", sanitized_summaries)
     audit_path = output_dir / f"audit-{timestamp}.csv"
+    import_path = output_dir / f"import-{timestamp}.xml"
     xml_path = output_dir / f"offers-{timestamp}.xml"
     summary_path = output_dir / f"summary-{timestamp}.json"
     write_audit_csv(audit_path, changes)
-    xml_bytes = build_offers_xml(changes, config["commerce_catalog_id"], config["commerce_catalog_name"])
+    xml_bytes = build_offers_xml(
+        changes,
+        items,
+        config["commerce_catalog_id"],
+        config["commerce_catalog_name"],
+    )
+    import_bytes = build_import_xml(
+        items,
+        changes,
+        config["commerce_catalog_id"],
+        config["commerce_catalog_name"],
+    )
+    import_path.write_bytes(import_bytes)
     xml_path.write_bytes(xml_bytes)
     result = dict(summary)
     result.update({
@@ -677,8 +788,11 @@ def run_once(base_dir: Path, config: dict[str, Any], args: argparse.Namespace) -
         "store": config["store_name"],
         "created_at": utc_now(),
         "audit_file": str(audit_path),
+        "import_file": str(import_path),
         "xml_file": str(xml_path),
         "applied": False,
+        "submitted": False,
+        "verified": False,
     })
     if args.apply:
         if args.confirm != CONFIRM_PHRASE:
@@ -695,20 +809,18 @@ def run_once(base_dir: Path, config: dict[str, Any], args: argparse.Namespace) -
                 float(config.get("retry_backoff_seconds", 2)),
             )
             transcript = cml.upload_offers(
+                import_bytes,
                 xml_bytes,
-                config["commerce_catalog_id"],
-                config["commerce_catalog_name"],
             )
             result["commerce_transcript"] = [
-                {"operation": operation, "response": response[:500]}
+                {"operation": operation, "response": safe_transcript_response(operation, response)}
                 for operation, response in transcript
             ]
-            result["applied"] = True
-            next_state = dict(state)
-            for change in changes:
-                next_state[change.external_id] = change.new_quantity
-            write_state_atomic(state_path, next_state)
-            logging.info("Applied %s stock changes to Tilda", len(changes))
+            result["submitted"] = True
+            logging.warning(
+                "Submitted %s stock changes to Tilda; catalog verification is still required",
+                len(changes),
+            )
     summary_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     logging.info(
         "Summary: matched=%s/%s, unmatched=%s, changes=%s, mode=%s",
@@ -736,6 +848,8 @@ def main() -> int:
     config_path = (base_dir / args.config).resolve() if not Path(args.config).is_absolute() else Path(args.config)
     try:
         config = load_config(config_path)
+        if args.watch and args.apply:
+            raise SyncError("Continuous apply is disabled until Tilda updates can be verified automatically")
         setup_logging(base_dir / config["log_dir"], args.verbose)
         lock_path = base_dir / "sync.lock"
         lock_fd = acquire_lock(lock_path)

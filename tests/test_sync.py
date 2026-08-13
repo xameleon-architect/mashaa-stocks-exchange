@@ -59,21 +59,36 @@ class SyncTests(unittest.TestCase):
                 minimum_match_ratio=0.98,
             )
 
-    def test_offers_xml_contains_only_external_id_and_quantity(self):
+    def test_offers_xml_links_variant_to_parent_and_contains_quantity(self):
+        items = [
+            sync.TildaItem("100", "PRODUCT-1", "Dress", None, "", ""),
+            sync.TildaItem("101", "EXT-1", "Dress M", Decimal("10"), "100", "Размер:M"),
+        ]
         changes = [
             sync.Change("EXT-1", "101", "Dress M", "variant", Decimal("10"), Decimal("3"), Decimal("0"), Decimal("0"), Decimal("3"))
         ]
-        xml = sync.build_offers_xml(changes, "catalog", "Catalog").decode("utf-8")
-        self.assertIn("<Ид>EXT-1</Ид>", xml)
+        xml = sync.build_offers_xml(changes, items, "catalog", "Catalog").decode("utf-8")
+        self.assertIn("<Ид>PRODUCT-1#EXT-1</Ид>", xml)
+        self.assertIn("<ХарактеристикиТовара>", xml)
+        self.assertIn("<Наименование>Размер</Наименование>", xml)
+        self.assertIn("<Значение>M</Значение>", xml)
         self.assertIn("<Количество>3</Количество>", xml)
         self.assertNotIn("101", xml)
 
-    def test_import_stub_is_changes_only_and_contains_no_products(self):
-        xml = sync.build_import_stub_xml("catalog", "Catalog").decode("utf-8")
+    def test_import_xml_contains_changed_parent_product(self):
+        items = [
+            sync.TildaItem("100", "PRODUCT-1", "Dress", None, "", ""),
+            sync.TildaItem("101", "EXT-1", "Dress M", Decimal("10"), "100", "Размер:M"),
+        ]
+        changes = [
+            sync.Change("EXT-1", "101", "Dress M", "variant", Decimal("10"), Decimal("3"), Decimal("0"), Decimal("0"), Decimal("3"))
+        ]
+        xml = sync.build_import_xml(items, changes, "catalog", "Catalog").decode("utf-8")
         self.assertIn('<Каталог СодержитТолькоИзменения="true">', xml)
         self.assertIn("<Ид>catalog</Ид>", xml)
-        self.assertIn("<Товары />", xml)
-        self.assertNotIn("<Товар>", xml)
+        self.assertIn("<Товар>", xml)
+        self.assertIn("<Ид>PRODUCT-1</Ид>", xml)
+        self.assertIn("<Наименование>Dress</Наименование>", xml)
 
     def test_state_round_trip(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -184,7 +199,7 @@ class SyncTests(unittest.TestCase):
                 return next(self.responses)
 
         client = FakeCommerceML()
-        transcript = client.upload_offers(b"<xml/>", "catalog", "Catalog")
+        transcript = client.upload_offers(b"<import/>", b"<xml/>")
         self.assertEqual(
             [
                 "checkauth",
@@ -200,7 +215,7 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(3, sum(call[0] == "import" for call in client.calls))
         file_calls = [call for call in client.calls if call[0] == "file"]
         self.assertEqual(["import0_1.xml", "offers0_1.xml"], [call[2] for call in file_calls])
-        self.assertIn("<Каталог".encode("utf-8"), file_calls[0][3])
+        self.assertEqual(b"<import/>", file_calls[0][3])
         self.assertEqual(b"<xml/>", file_calls[1][3])
         self.assertEqual("session=abc", client.headers["Cookie"])
 
@@ -221,6 +236,28 @@ class SyncTests(unittest.TestCase):
         client = MinimalCommerceML()
         client._apply_checkauth_cookie("success\nPHPSESSID\nsecret-session-value")
         self.assertEqual("PHPSESSID=secret-session-value", client.headers["Cookie"])
+
+    def test_checkauth_cookie_is_redacted_from_transcript(self):
+        response = "success\nPHPSESSID\nsecret-session-value"
+        self.assertEqual("success", sync.safe_transcript_response("checkauth", response))
+
+    def test_existing_summary_cookie_is_sanitized(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "summary-old.json"
+            path.write_text(json.dumps({
+                "mode": "apply",
+                "applied": True,
+                "commerce_transcript": [{
+                    "operation": "checkauth",
+                    "response": "success\nPHPSESSID\nsecret-session-value",
+                }]
+            }), encoding="utf-8")
+            self.assertEqual(1, sync.sanitize_summary_files(path.parent))
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual("success", payload["commerce_transcript"][0]["response"])
+            self.assertFalse(payload["applied"])
+            self.assertTrue(payload["submitted"])
+            self.assertFalse(payload["verified"])
 
 
 if __name__ == "__main__":

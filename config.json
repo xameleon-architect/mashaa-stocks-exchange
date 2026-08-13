@@ -13,7 +13,7 @@
   "clamp_negative_to_zero": true,
   "allow_fractional_quantity": false,
   "minimum_match_ratio": 0.98,
+  "trust_local_state": false,
   "commerce_catalog_id": "mashaa-test",
   "commerce_catalog_name": "Mashaa Test Stock"
 }
-
