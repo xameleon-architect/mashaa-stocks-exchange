@@ -1,0 +1,19 @@
+{
+  "moysklad_api_base": "https://api.moysklad.ru/api/remap/1.2",
+  "store_name": "Склад офиса",
+  "tilda_catalog_csv": "data/tilda_catalog.csv",
+  "state_file": "state.json",
+  "log_dir": "logs",
+  "output_dir": "output",
+  "request_timeout_seconds": 30,
+  "retry_attempts": 3,
+  "retry_backoff_seconds": 2,
+  "page_size": 1000,
+  "watch_interval_seconds": 60,
+  "clamp_negative_to_zero": true,
+  "allow_fractional_quantity": false,
+  "minimum_match_ratio": 0.98,
+  "commerce_catalog_id": "mashaa-test",
+  "commerce_catalog_name": "Mashaa Test Stock"
+}
+
