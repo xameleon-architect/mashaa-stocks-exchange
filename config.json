@@ -5,6 +5,7 @@
   "state_file": "state.json",
   "log_dir": "logs",
   "output_dir": "output",
+  "status_dir": "status",
   "request_timeout_seconds": 30,
   "retry_attempts": 3,
   "retry_backoff_seconds": 2,

@@ -1,8 +1,10 @@
 .env
-.venv/
 logs/*.log
+logs/*.jsonl
 output/*
 !output/.gitkeep
+status/*
+!status/.gitkeep
 state.json
 sync.lock
 __pycache__/

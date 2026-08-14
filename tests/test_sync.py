@@ -1,9 +1,11 @@
 import json
+import argparse
 import sys
 import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -11,6 +13,67 @@ import sync
 
 
 class SyncTests(unittest.TestCase):
+    def write_small_catalog(self, base: Path) -> None:
+        data_dir = base / "data"
+        data_dir.mkdir()
+        (data_dir / "catalog.csv").write_text(
+            "Tilda UID;External ID;Title;Quantity;Parent UID;Editions\n"
+            "100;PRODUCT-1;Dress;;;\n"
+            "101;EXT-1;Dress M;10;100;Размер:M\n",
+            encoding="utf-8-sig",
+        )
+
+    def small_config(self):
+        return {
+            "moysklad_api_base": "https://example.invalid",
+            "store_name": "Склад офиса",
+            "tilda_catalog_csv": "data/catalog.csv",
+            "state_file": "state.json",
+            "log_dir": "logs",
+            "output_dir": "output",
+            "status_dir": "status",
+            "request_timeout_seconds": 1,
+            "retry_attempts": 1,
+            "retry_backoff_seconds": 0,
+            "page_size": 1000,
+            "clamp_negative_to_zero": True,
+            "allow_fractional_quantity": False,
+            "minimum_match_ratio": 1.0,
+            "trust_local_state": False,
+            "commerce_catalog_id": "catalog",
+            "commerce_catalog_name": "Catalog",
+        }
+
+    def test_run_once_dry_run_produces_human_and_machine_status(self):
+        class FakeMoySklad:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def resolve_store(self, name):
+                return {"name": name}
+
+            def stock_by_store(self, store):
+                return {
+                    "EXT-1": sync.SourceStock(
+                        "EXT-1", "Dress M", "variant",
+                        Decimal("7"), Decimal("0"), Decimal("0"), Decimal("7"),
+                    )
+                }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            self.write_small_catalog(base)
+            args = argparse.Namespace(apply=False, confirm="", full=False)
+            with mock.patch.object(sync, "require_env", return_value="test-token"), mock.patch.object(sync, "MoySkladClient", FakeMoySklad):
+                result = sync.run_once(base, self.small_config(), args)
+
+            latest = json.loads((base / "status" / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual("DRY_RUN_READY", result["status"])
+            self.assertEqual("DRY_RUN_READY", latest["status"])
+            self.assertEqual(1, latest["changes"])
+            self.assertFalse(latest["submitted"])
+            self.assertTrue(Path(latest["audit_file"]).exists())
+
     def test_tilda_snapshot_counts_and_ids(self):
         base = Path(__file__).resolve().parents[1]
         items = sync.read_tilda_catalog(base / "data" / "tilda_catalog.csv")

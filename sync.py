@@ -27,15 +27,31 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable
 
+from observability import ExchangeRun
+
 
 APP_NAME = "mashaa-tilda-sync"
-APP_VERSION = "0.4"
+APP_VERSION = "0.5"
 CONFIRM_PHRASE = "APPLY-TEST-TILDA"
 TRANSIENT_HTTP_CODES = {408, 425, 429, 500, 502, 503, 504}
 
 
 class SyncError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        action: str | None = None,
+        blocked: bool = False,
+        outcome_unknown: bool = False,
+    ):
+        super().__init__(message)
+        self.code = code
+        self.action = action
+        self.blocked = blocked
+        self.outcome_unknown = outcome_unknown
+        self.observed = False
 
 
 @dataclass(frozen=True)
@@ -573,6 +589,7 @@ class CommerceMLClient:
             "Authorization": f"Basic {token}",
             "User-Agent": f"{APP_NAME}/{APP_VERSION}",
         }
+        self.submission_started = False
 
     def _request(self, mode: str, *, method: str = "GET", data: bytes | None = None, filename: str | None = None) -> str:
         query: dict[str, str] = {"type": "catalog", "mode": mode}
@@ -658,11 +675,12 @@ class CommerceMLClient:
         if "zip=" not in init.lower() and not init.lower().startswith("success"):
             raise SyncError(f"CommerceML init failed: {init[:500]}")
         if re.search(r"(?im)^zip\s*=\s*yes\s*$", init):
-            raise SyncError("Tilda requested ZIP CommerceML upload; version 0.1 supports only zip=no")
+            raise SyncError("Tilda requested ZIP CommerceML upload; version 0.5 supports only zip=no")
         for operation, filename, payload in (
             ("file-import", import_filename, import_bytes),
             ("file-offers", offers_filename, xml_bytes),
         ):
+            self.submission_started = True
             upload = self._request("file", method="POST", data=payload, filename=filename)
             transcript.append((operation, upload))
             self._expect_success(upload, operation)
@@ -723,82 +741,135 @@ def release_lock(path: Path, descriptor: int) -> None:
         path.unlink(missing_ok=True)
 
 
-def run_once(base_dir: Path, config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
-    token = require_env("MOYSKLAD_TOKEN")
-    http = JsonHttpClient(
-        token,
-        int(config.get("request_timeout_seconds", 30)),
-        int(config.get("retry_attempts", 3)),
-        float(config.get("retry_backoff_seconds", 2)),
-    )
-    ms = MoySkladClient(config["moysklad_api_base"], http, int(config.get("page_size", 1000)))
-    tilda_csv = base_dir / config["tilda_catalog_csv"]
-    state_path = base_dir / config["state_file"]
-    items = read_tilda_catalog(tilda_csv)
-    logging.info("Tilda snapshot loaded: %s rows", len(items))
-    store = ms.resolve_store(config["store_name"])
-    logging.info("MoySklad store resolved: %s", store.get("name"))
-    source = ms.stock_by_store(store)
-    logging.info("MoySklad stock entities loaded: %s", len(source))
-    if bool(config.get("trust_local_state", False)):
-        state = read_state(state_path, items)
-    else:
-        state = {
-            item.external_id: item.current_quantity
-            for item in items
-            if item.external_id and item.current_quantity is not None
+def change_preview(changes: list[Change], limit: int = 20) -> list[dict[str, Any]]:
+    return [
+        {
+            "external_id": change.external_id,
+            "title": change.title,
+            "previous_quantity": None if change.previous_quantity is None else format_quantity(change.previous_quantity),
+            "new_quantity": format_quantity(change.new_quantity),
         }
-    changes, summary = calculate_changes(
-        items,
-        source,
-        state,
-        clamp_negative=bool(config.get("clamp_negative_to_zero", True)),
-        allow_fractional=bool(config.get("allow_fractional_quantity", False)),
-        full=bool(args.full),
-        minimum_match_ratio=float(config.get("minimum_match_ratio", 0.98)),
-    )
-    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_dir = base_dir / config["output_dir"]
-    output_dir.mkdir(parents=True, exist_ok=True)
-    sanitized_summaries = sanitize_summary_files(output_dir)
-    if sanitized_summaries:
-        logging.warning("Redacted session data from %s existing summary file(s)", sanitized_summaries)
-    audit_path = output_dir / f"audit-{timestamp}.csv"
-    import_path = output_dir / f"import-{timestamp}.xml"
-    xml_path = output_dir / f"offers-{timestamp}.xml"
-    summary_path = output_dir / f"summary-{timestamp}.json"
-    write_audit_csv(audit_path, changes)
-    xml_bytes = build_offers_xml(
-        changes,
-        items,
-        config["commerce_catalog_id"],
-        config["commerce_catalog_name"],
-    )
-    import_bytes = build_import_xml(
-        items,
-        changes,
-        config["commerce_catalog_id"],
-        config["commerce_catalog_name"],
-    )
-    import_path.write_bytes(import_bytes)
-    xml_path.write_bytes(xml_bytes)
-    result = dict(summary)
-    result.update({
-        "mode": "apply" if args.apply else "dry-run",
+        for change in changes[:limit]
+    ]
+
+
+def write_bytes_atomic(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_bytes(content)
+    temp.replace(path)
+
+
+def run_once(base_dir: Path, config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    mode = "apply" if args.apply else "dry-run"
+    observer = ExchangeRun(base_dir, config, mode=mode, app_version=APP_VERSION)
+    result: dict[str, Any] = {
+        "mode": mode,
         "store": config["store_name"],
         "created_at": utc_now(),
-        "audit_file": str(audit_path),
-        "import_file": str(import_path),
-        "xml_file": str(xml_path),
         "applied": False,
         "submitted": False,
         "verified": False,
-    })
-    if args.apply:
-        if args.confirm != CONFIRM_PHRASE:
+        "changes": 0,
+    }
+    observer.start()
+    try:
+        observer.begin_step(1, "Проверка настроек и режима запуска")
+        token = require_env("MOYSKLAD_TOKEN")
+        if args.apply and args.confirm != CONFIRM_PHRASE:
             raise SyncError(f"Live write requires --confirm {CONFIRM_PHRASE}")
-        if not changes:
-            logging.info("No stock changes to send")
+        http = JsonHttpClient(
+            token,
+            int(config.get("request_timeout_seconds", 30)),
+            int(config.get("retry_attempts", 3)),
+            float(config.get("retry_backoff_seconds", 2)),
+        )
+        ms = MoySkladClient(config["moysklad_api_base"], http, int(config.get("page_size", 1000)))
+        observer.end_step("OK", "Настройки загружены; секреты в журнал не записываются")
+
+        observer.begin_step(2, "Чтение снимка каталога Tilda")
+        tilda_csv = base_dir / config["tilda_catalog_csv"]
+        items = read_tilda_catalog(tilda_csv)
+        stock_item_count = sum(item.current_quantity is not None for item in items)
+        observer.end_step(
+            "OK",
+            f"Загружено {len(items)} строк, из них {stock_item_count} строк с остатками",
+            tilda_rows=len(items),
+            stock_rows=stock_item_count,
+        )
+
+        observer.begin_step(3, "Чтение склада и остатков МоегоСклада")
+        store = ms.resolve_store(config["store_name"])
+        source = ms.stock_by_store(store)
+        observer.end_step("OK", f"Склад найден; получено {len(source)} позиций", source_rows=len(source))
+
+        observer.begin_step(4, "Сопоставление и проверка данных")
+        state_path = base_dir / config["state_file"]
+        if bool(config.get("trust_local_state", False)):
+            state = read_state(state_path, items)
+            comparison_source = "local_state"
+        else:
+            state = {
+                item.external_id: item.current_quantity
+                for item in items
+                if item.external_id and item.current_quantity is not None
+            }
+            comparison_source = "tilda_snapshot"
+        changes, summary = calculate_changes(
+            items,
+            source,
+            state,
+            clamp_negative=bool(config.get("clamp_negative_to_zero", True)),
+            allow_fractional=bool(config.get("allow_fractional_quantity", False)),
+            full=bool(args.full),
+            minimum_match_ratio=float(config.get("minimum_match_ratio", 0.98)),
+        )
+        result.update(summary)
+        result["comparison_source"] = comparison_source
+        observer.end_step(
+            "OK",
+            f"Сопоставлено {summary['matched']} из {summary['stock_rows']} ({summary['match_ratio']:.1%})",
+            matched=summary["matched"],
+            unmatched=summary["unmatched"],
+            match_ratio=summary["match_ratio"],
+        )
+
+        observer.begin_step(5, "Расчёт изменений остатков")
+        result["change_preview"] = change_preview(changes)
+        observer.end_step("OK", f"Найдено изменений: {len(changes)}", changes=len(changes))
+        for change in changes[:10]:
+            previous = "не задано" if change.previous_quantity is None else format_quantity(change.previous_quantity)
+            observer.detail(f"{change.title}: {previous} -> {format_quantity(change.new_quantity)} шт.")
+        if len(changes) > 10:
+            observer.detail(f"Ещё изменений: {len(changes) - 10}; полный список находится в audit CSV")
+
+        observer.begin_step(6, "Подготовка CommerceML и контрольных файлов")
+        output_dir = base_dir / config["output_dir"]
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sanitized_summaries = sanitize_summary_files(output_dir)
+        if sanitized_summaries:
+            logging.warning("Очищены session cookie в старых summary: %s файл(ов)", sanitized_summaries)
+        file_token = observer.run_id
+        audit_path = output_dir / f"audit-{file_token}.csv"
+        import_path = output_dir / f"import-{file_token}.xml"
+        xml_path = output_dir / f"offers-{file_token}.xml"
+        write_audit_csv(audit_path, changes)
+        xml_bytes = build_offers_xml(changes, items, config["commerce_catalog_id"], config["commerce_catalog_name"])
+        import_bytes = build_import_xml(items, changes, config["commerce_catalog_id"], config["commerce_catalog_name"])
+        write_bytes_atomic(import_path, import_bytes)
+        write_bytes_atomic(xml_path, xml_bytes)
+        result.update({
+            "audit_file": str(audit_path),
+            "import_file": str(import_path),
+            "xml_file": str(xml_path),
+        })
+        observer.end_step("OK", "Audit CSV, import0_1.xml и offers0_1.xml подготовлены")
+
+        observer.begin_step(7, "Передача пакета в Tilda")
+        if not args.apply:
+            observer.end_step("WARN", "Dry-run: отправка в Tilda не выполнялась")
+        elif not changes:
+            observer.end_step("OK", "Изменений нет; отправка не требуется")
         else:
             cml = CommerceMLClient(
                 require_env("TILDA_CML_URL"),
@@ -808,25 +879,38 @@ def run_once(base_dir: Path, config: dict[str, Any], args: argparse.Namespace) -
                 int(config.get("retry_attempts", 3)),
                 float(config.get("retry_backoff_seconds", 2)),
             )
-            transcript = cml.upload_offers(
-                import_bytes,
-                xml_bytes,
-            )
+            try:
+                transcript = cml.upload_offers(import_bytes, xml_bytes)
+            except SyncError as exc:
+                ambiguous = "request failed" in str(exc).lower() or "did not finish" in str(exc).lower()
+                if cml.submission_started and ambiguous:
+                    exc.outcome_unknown = True
+                raise
             result["commerce_transcript"] = [
                 {"operation": operation, "response": safe_transcript_response(operation, response)}
                 for operation, response in transcript
             ]
             result["submitted"] = True
-            logging.warning(
-                "Submitted %s stock changes to Tilda; catalog verification is still required",
-                len(changes),
-            )
-    summary_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    logging.info(
-        "Summary: matched=%s/%s, unmatched=%s, changes=%s, mode=%s",
-        summary["matched"], summary["stock_rows"], summary["unmatched"], summary["changes"], result["mode"],
-    )
-    return result
+            observer.end_step("OK", f"Tilda приняла и обработала пакет из {len(changes)} изменений", submitted=True)
+
+        observer.begin_step(8, "Проверка результата в каталоге Tilda")
+        if result["submitted"]:
+            observer.end_step("WARN", "Автоматический read-back пока не реализован; результат не подтверждён", verified=False)
+            status = "SUBMITTED_UNVERIFIED"
+        elif changes and not args.apply:
+            observer.end_step("WARN", "Проверка не требуется: это был dry-run", verified=False)
+            status = "DRY_RUN_READY"
+        else:
+            observer.end_step("OK", "Изменений для проверки нет", verified=False)
+            status = "NO_CHANGES"
+        return observer.finish(status, result)
+    except SyncError as exc:
+        exc.observed = True
+        observer.fail(exc, result)
+        raise
+    except Exception as exc:
+        observer.fail(exc, result)
+        raise
 
 
 def parse_args() -> argparse.Namespace:
@@ -844,13 +928,21 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     base_dir = Path(__file__).resolve().parent
-    load_dotenv((base_dir / args.env).resolve() if not Path(args.env).is_absolute() else Path(args.env))
     config_path = (base_dir / args.config).resolve() if not Path(args.config).is_absolute() else Path(args.config)
+    fallback_config: dict[str, Any] = {
+        "store_name": "не определён",
+        "log_dir": "logs",
+        "output_dir": "output",
+        "status_dir": "status",
+    }
+    config: dict[str, Any] = fallback_config
+    setup_logging(base_dir / "logs", args.verbose)
     try:
+        load_dotenv((base_dir / args.env).resolve() if not Path(args.env).is_absolute() else Path(args.env))
         config = load_config(config_path)
+        setup_logging(base_dir / config["log_dir"], args.verbose)
         if args.watch and args.apply:
             raise SyncError("Continuous apply is disabled until Tilda updates can be verified automatically")
-        setup_logging(base_dir / config["log_dir"], args.verbose)
         lock_path = base_dir / "sync.lock"
         lock_fd = acquire_lock(lock_path)
         try:
@@ -861,8 +953,8 @@ def main() -> int:
                     started = time.monotonic()
                     try:
                         run_once(base_dir, config, args)
-                    except SyncError as exc:
-                        logging.error("Sync cycle failed: %s", exc)
+                    except SyncError:
+                        pass
                     elapsed = time.monotonic() - started
                     time.sleep(max(1, interval - elapsed))
             else:
@@ -874,9 +966,26 @@ def main() -> int:
         logging.warning("Stopped by user")
         return 130
     except SyncError as exc:
-        logging.error("%s", exc)
+        if not exc.observed:
+            observer = ExchangeRun(
+                base_dir,
+                config,
+                mode="apply" if args.apply else "dry-run",
+                app_version=APP_VERSION,
+            )
+            observer.start()
+            observer.begin_step(1, "Проверка настроек и режима запуска")
+            observer.fail(exc)
         return 2
-    except Exception:
+    except Exception as exc:
+        observer = ExchangeRun(
+            base_dir,
+            config,
+            mode="apply" if args.apply else "dry-run",
+            app_version=APP_VERSION,
+        )
+        observer.start()
+        observer.fail(exc)
         logging.exception("Unexpected error")
         return 3
 
