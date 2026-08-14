@@ -27,7 +27,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable
 
-from observability import ExchangeRun
+from observability import ERROR_TRACE_LOGGER, ExchangeRun
 
 
 APP_NAME = "mashaa-tilda-sync"
@@ -158,21 +158,41 @@ def load_config(path: Path) -> dict[str, Any]:
     return config
 
 
-def setup_logging(log_dir: Path, verbose: bool) -> Path:
+def daily_log_paths(log_dir: Path, when: dt.datetime | None = None) -> tuple[Path, Path]:
+    current = when or dt.datetime.now()
+    suffix = current.strftime("%Y-%m-%d")
+    return log_dir / f"access-{suffix}.log", log_dir / f"error-{suffix}.log"
+
+
+def _close_handlers(logger: logging.Logger) -> None:
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()
+
+
+def setup_logging(log_dir: Path, verbose: bool) -> tuple[Path, Path]:
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"sync-{dt.datetime.now():%Y-%m-%d}.log"
+    access_path, error_path = daily_log_paths(log_dir)
     level = logging.DEBUG if verbose else logging.INFO
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     root = logging.getLogger()
     root.setLevel(level)
-    root.handlers.clear()
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
-    file_handler.setFormatter(formatter)
+    _close_handlers(root)
+    access_handler = logging.FileHandler(access_path, encoding="utf-8")
+    access_handler.setFormatter(formatter)
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
-    root.addHandler(file_handler)
+    root.addHandler(access_handler)
     root.addHandler(console_handler)
-    return log_path
+
+    error_logger = logging.getLogger(ERROR_TRACE_LOGGER)
+    error_logger.setLevel(logging.ERROR)
+    error_logger.propagate = False
+    _close_handlers(error_logger)
+    error_handler = logging.FileHandler(error_path, encoding="utf-8")
+    error_handler.setFormatter(formatter)
+    error_logger.addHandler(error_handler)
+    return access_path, error_path
 
 
 def decimal_or_none(value: Any) -> Decimal | None:
@@ -909,6 +929,7 @@ def run_once(base_dir: Path, config: dict[str, Any], args: argparse.Namespace) -
         observer.fail(exc, result)
         raise
     except Exception as exc:
+        exc.observed = True
         observer.fail(exc, result)
         raise
 
@@ -978,15 +999,15 @@ def main() -> int:
             observer.fail(exc)
         return 2
     except Exception as exc:
-        observer = ExchangeRun(
-            base_dir,
-            config,
-            mode="apply" if args.apply else "dry-run",
-            app_version=APP_VERSION,
-        )
-        observer.start()
-        observer.fail(exc)
-        logging.exception("Unexpected error")
+        if not getattr(exc, "observed", False):
+            observer = ExchangeRun(
+                base_dir,
+                config,
+                mode="apply" if args.apply else "dry-run",
+                app_version=APP_VERSION,
+            )
+            observer.start()
+            observer.fail(exc)
         return 3
 
 

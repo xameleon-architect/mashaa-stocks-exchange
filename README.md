@@ -62,7 +62,8 @@ TILDA_CML_PASSWORD=...
 - `output/import-*.xml` — минимальный каталог изменяемых товаров;
 - `output/offers-*.xml` — предложения и остатки;
 - `output/summary-*.json` — итог конкретного запуска;
-- `logs/sync-YYYY-MM-DD.log` — понятный текстовый журнал;
+- `logs/access-YYYY-MM-DD.log` — человекочитаемый журнал запусков и этапов обмена;
+- `logs/error-YYYY-MM-DD.log` — ошибки с полным очищенным Python traceback, `run_id` и этапом;
 - `logs/events-YYYY-MM-DD.jsonl` — структурированная история этапов;
 - `status/latest.json` — состояние последнего запуска.
 
@@ -137,7 +138,8 @@ TILDA_CML_PASSWORD=...
 
 - `output/summary-*.json`;
 - `output/audit-*.csv`;
-- `logs/sync-YYYY-MM-DD.log`.
+- `logs/access-YYYY-MM-DD.log`;
+- `logs/error-YYYY-MM-DD.log`.
 
 Файл `.env` передавать нельзя.
 

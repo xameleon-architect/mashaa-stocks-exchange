@@ -1,4 +1,6 @@
+import datetime as dt
 import json
+import logging
 import sys
 import tempfile
 import unittest
@@ -6,6 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import sync
 from observability import ExchangeRun, classify_error, redact_text
 
 
@@ -17,6 +20,28 @@ class ObservabilityTests(unittest.TestCase):
             "output_dir": "output",
             "status_dir": "status",
         }
+
+    def test_daily_logs_are_named_access_and_error(self):
+        base = Path("logs")
+        access, error = sync.daily_log_paths(base, dt.datetime(2026, 8, 14))
+        self.assertEqual(base / "access-2026-08-14.log", access)
+        self.assertEqual(base / "error-2026-08-14.log", error)
+
+    def test_failure_emits_full_traceback_to_error_logger(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run = ExchangeRun(Path(temp_dir), self.config(), mode="dry-run", app_version="test")
+            run.start()
+            run.begin_step(3, "Тестовая ошибка")
+            try:
+                raise ValueError("trace-marker")
+            except ValueError as exc:
+                with self.assertLogs("mashaa.error_trace", level=logging.ERROR) as captured:
+                    run.fail(exc)
+            text = "\n".join(captured.output)
+            self.assertIn("Traceback (most recent call last)", text)
+            self.assertIn("ValueError: trace-marker", text)
+            self.assertIn(run.run_id, text)
+            self.assertIn("Этап 3/8", text)
 
     def test_completed_run_writes_summary_latest_and_jsonl(self):
         with tempfile.TemporaryDirectory() as temp_dir:

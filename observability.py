@@ -7,10 +7,14 @@ import json
 import logging
 import re
 import time
+import traceback
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+
+ERROR_TRACE_LOGGER = "mashaa.error_trace"
 
 
 FINAL_STATUS_MESSAGES = {
@@ -66,6 +70,19 @@ def redact_text(value: Any) -> str:
         text,
     )
     return text
+
+
+def log_error_trace(exc: BaseException, *, run_id: str, stage_index: int, stage: str) -> None:
+    """Write a redacted full traceback to the dedicated error journal."""
+    trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    logging.getLogger(ERROR_TRACE_LOGGER).error(
+        "run_id=%s | Этап %s/%s — %s\n%s",
+        run_id,
+        stage_index,
+        ExchangeRun.total_steps,
+        stage,
+        redact_text(trace).rstrip(),
+    )
 
 
 def classify_error(exc: BaseException) -> ErrorInfo:
@@ -221,6 +238,12 @@ class ExchangeRun:
         logging.error("[ERROR] Этап %s/%s — %s", self.stage_index, self.total_steps, self.stage)
         logging.error("Код: %s | Причина: %s", info.code, message)
         logging.error("Действие: %s", info.action)
+        log_error_trace(
+            exc,
+            run_id=self.run_id,
+            stage_index=self.stage_index,
+            stage=self.stage,
+        )
         return self.finish(status, payload)
 
     def _persist(self, payload: dict[str, Any]) -> None:
