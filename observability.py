@@ -246,6 +246,23 @@ class ExchangeRun:
         )
         return self.finish(status, payload)
 
+    def record_notification(self, notification: dict[str, Any]) -> dict[str, Any]:
+        """Attach an auxiliary delivery result without changing exchange status."""
+        if not self.final_payload:
+            raise RuntimeError("Exchange must be finished before recording a notification")
+        payload = dict(self.final_payload)
+        payload["max_notification"] = dict(notification)
+        self.final_payload = payload
+        self.event(
+            "max_notification",
+            status=str(notification.get("status", "unknown")).upper(),
+            message=str(notification.get("reason") or notification.get("error") or "MAX notification processed"),
+            channel=notification.get("channel"),
+            chat_id_masked=notification.get("chat_id_masked"),
+        )
+        self._persist(payload)
+        return dict(payload)
+
     def _persist(self, payload: dict[str, Any]) -> None:
         for path in (self.summary_path, self.latest_path):
             try:

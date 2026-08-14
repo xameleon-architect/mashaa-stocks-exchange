@@ -11,5 +11,5 @@ py -3 -m venv .venv
 if errorlevel 1 exit /b 1
 if not exist ".env" copy ".env.example" ".env" >nul
 echo.
-echo Installed. Open .env in Notepad and fill in the four values.
+echo Installed. Open .env in Notepad and fill in the required values.
 pause

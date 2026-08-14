@@ -16,5 +16,16 @@
   "minimum_match_ratio": 0.98,
   "trust_local_state": false,
   "commerce_catalog_id": "mashaa-test",
-  "commerce_catalog_name": "Mashaa Test Stock"
+  "commerce_catalog_name": "Mashaa Test Stock",
+  "max_notifications": {
+    "api_base": "https://platform-api2.max.ru",
+    "timeout_seconds": 10,
+    "notify": true,
+    "statuses": [
+      "SUBMITTED_UNVERIFIED",
+      "BLOCKED",
+      "FAILED",
+      "OUTCOME_UNKNOWN"
+    ]
+  }
 }

@@ -28,10 +28,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from observability import ERROR_TRACE_LOGGER, ExchangeRun
+from max_notifications import notify_exchange
 
 
 APP_NAME = "mashaa-tilda-sync"
-APP_VERSION = "0.5"
+APP_VERSION = "0.6"
 CONFIRM_PHRASE = "APPLY-TEST-TILDA"
 TRANSIENT_HTTP_CODES = {408, 425, 429, 500, 502, 503, 504}
 
@@ -780,6 +781,12 @@ def write_bytes_atomic(path: Path, content: bytes) -> None:
     temp.replace(path)
 
 
+def notify_and_record(observer: ExchangeRun, payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Deliver the final status to MAX and persist the auxiliary outcome."""
+    notification = notify_exchange(payload, config)
+    return observer.record_notification(notification)
+
+
 def run_once(base_dir: Path, config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     mode = "apply" if args.apply else "dry-run"
     observer = ExchangeRun(base_dir, config, mode=mode, app_version=APP_VERSION)
@@ -923,14 +930,17 @@ def run_once(base_dir: Path, config: dict[str, Any], args: argparse.Namespace) -
         else:
             observer.end_step("OK", "Изменений для проверки нет", verified=False)
             status = "NO_CHANGES"
-        return observer.finish(status, result)
+        payload = observer.finish(status, result)
+        return notify_and_record(observer, payload, config)
     except SyncError as exc:
         exc.observed = True
-        observer.fail(exc, result)
+        payload = observer.fail(exc, result)
+        notify_and_record(observer, payload, config)
         raise
     except Exception as exc:
         exc.observed = True
-        observer.fail(exc, result)
+        payload = observer.fail(exc, result)
+        notify_and_record(observer, payload, config)
         raise
 
 
@@ -996,7 +1006,8 @@ def main() -> int:
             )
             observer.start()
             observer.begin_step(1, "Проверка настроек и режима запуска")
-            observer.fail(exc)
+            payload = observer.fail(exc)
+            notify_and_record(observer, payload, config)
         return 2
     except Exception as exc:
         if not getattr(exc, "observed", False):
@@ -1007,7 +1018,8 @@ def main() -> int:
                 app_version=APP_VERSION,
             )
             observer.start()
-            observer.fail(exc)
+            payload = observer.fail(exc)
+            notify_and_record(observer, payload, config)
         return 3
 
 

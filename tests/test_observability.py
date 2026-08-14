@@ -69,6 +69,16 @@ class ObservabilityTests(unittest.TestCase):
             latest = json.loads(run.latest_path.read_text(encoding="utf-8"))
             self.assertEqual("NO_CHANGES", latest["status"])
 
+    def test_notification_result_is_added_without_changing_exchange_status(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run = ExchangeRun(Path(temp_dir), self.config(), mode="apply", app_version="0.6")
+            run.start()
+            run.finish("SUBMITTED_UNVERIFIED", {"changes": 2, "submitted": True})
+            payload = run.record_notification({"enabled": True, "status": "sent", "channel": "group_chat"})
+            latest = json.loads(run.latest_path.read_text(encoding="utf-8"))
+            self.assertEqual("SUBMITTED_UNVERIFIED", payload["status"])
+            self.assertEqual("sent", latest["max_notification"]["status"])
+
     def test_error_catalog_marks_validation_as_blocked(self):
         info = classify_error(RuntimeError("Match ratio 50% is below required 98%"))
         self.assertEqual("E_MATCH_RATIO", info.code)
